@@ -8,6 +8,13 @@ class JdbcApplicationTests {
 
   @Test
   void contextLoads() {
+    throw new IllegalArgumentException();
+
+  }
+
+  @Test
+  void hello() {
+
   }
 
 }
