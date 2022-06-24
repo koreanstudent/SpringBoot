@@ -1,0 +1,90 @@
+pipeline {
+  agent none
+  options { skipDefaultCheckout(true) }
+
+  environment {
+    GRADLE_IMAGE_NAME='gradle:7.4.1-jdk17'
+    S3_NAME=""
+    ECR_ADDRESS=''
+    ECR_REPOSITORY_NAME=""
+    ECR_KEEP_IMAGES="15"
+    EB_APPLICATION_NAME=""
+    EB_ENV_NAME=""
+    APP_NAME=""
+    BUILD_ENVIRONMENT="dev"
+  }
+
+  stages {
+    stage('Checkout Git') {
+      agent any
+      steps {
+        checkout scm
+      }
+    }
+
+    stage('Project Build') {
+      agent {
+        docker {
+          image "${GRADLE_IMAGE_NAME}"
+          args '-v /root/.m2:/root/.m2'
+        }
+      }
+      steps {
+        sh """
+        # Project build and test
+        gradle clean build -x test
+        """
+      }
+    }
+
+    stage('Docker build') {
+      agent any
+      steps {
+        sh """
+        # ecr login
+        aws ecr get-login-password --region ap-northeast-2 | docker login --username AWS --password-stdin ${ECR_ADDRESS} 
+
+        # create Dockerfile
+        sed -i "s|USE_ENVIRONMENT|${BUILD_ENVIRONMENT}|g" "${WORKSPACE}/Dockerfile"
+
+        # docker image build and push
+        docker buildx build --platform linux/amd64,linux/arm64/v8 --tag ${ECR_ADDRESS}/${ECR_REPOSITORY_NAME}:${BUILD_NUMBER} --push .
+
+        # ecr old images delete
+        aws ecr describe-images \
+            --repository-name ${ECR_REPOSITORY_NAME} \
+            --query 'imageDetails[]' \
+            | jq --raw-output 'sort_by(.imagePushedAt) | reverse | .[].imageDigest' | awk "NR > ${ECR_KEEP_IMAGES}" \
+            | xargs -I{} aws ecr batch-delete-image --repository-name ${ECR_REPOSITORY_NAME} --image-ids imageDigest={}
+        """
+      }
+    }
+
+    stage('Deploy EB') {
+      agent any
+      steps {
+        sh """
+        # create Dockerrun.aws.json
+        sed -i "s|JENKINS_BUILD_NUMBER|${BUILD_NUMBER}|g" "${WORKSPACE}/Dockerrun.aws.json"
+
+        # upload S3
+        aws s3 cp "${WORKSPACE}/Dockerrun.aws.json" s3://${S3_NAME}/${BUILD_ENVIRONMENT}-${APP_NAME}/${APP_NAME}-${BUILD_ENVIRONMENT}-${BUILD_NUMBER}.aws.json \
+            --region ap-northeast-2
+
+        # create new application at Beanstalk
+        aws elasticbeanstalk create-application-version \
+            --region ap-northeast-2 \
+            --application-name ${EB_APPLICATION_NAME} \
+            --version-label ${EB_APPLICATION_NAME}-build-${BUILD_NUMBER} \
+            --source-bundle S3Bucket="${S3_NAME}",S3Key="${BUILD_ENVIRONMENT}-${APP_NAME}/${APP_NAME}-${BUILD_ENVIRONMENT}-${BUILD_NUMBER}.aws.json"
+
+        # update new application to Beanstalk environment
+        aws elasticbeanstalk update-environment \
+            --region ap-northeast-2 \
+            --environment-name ${EB_ENV_NAME} \
+            --version-label ${EB_APPLICATION_NAME}-build-${BUILD_NUMBER}
+        """
+      }
+    }
+  }
+}
